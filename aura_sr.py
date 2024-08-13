@@ -774,7 +774,7 @@ class AuraSR:
         self.input_image_size = config["input_image_size"]
 
     @classmethod
-    def from_pretrained(cls, model_id: str = "fal-ai/AuraSR", use_safetensors: bool = True, device: str = "cuda"):
+    def from_pretrained(cls, model_id: str = "fal-ai/AuraSR-v2", use_safetensors: bool = True, device: str = "cuda", cache_dir = None):
         import json
         import torch
         from pathlib import Path
@@ -804,7 +804,7 @@ class AuraSR:
             config = json.loads(config_path.read_text())
             hf_model_path = local_file.parent
         else:
-            hf_model_path = Path(snapshot_download(model_id))
+            hf_model_path = Path(snapshot_download(model_id, cache_dir=cache_dir))
             config = json.loads((hf_model_path / "config.json").read_text())
 
         model = cls(config, device)
@@ -854,6 +854,50 @@ class AuraSR:
 
         merged_tensor = merge_tiles(reconstructed_tiles, h_chunks, w_chunks, self.input_image_size * 4)
         unpadded = merged_tensor[:, :h * 4, :w * 4]
+
+        to_pil = transforms.ToPILImage()
+        return to_pil(unpadded)
+
+    @torch.no_grad()
+    def upscale_2x(self, image: Image.Image, max_batch_size=8) -> Image.Image:
+        """
+        Custom function. Upscale an input image by 2x using the upscaler.
+    
+        Args:
+        image (PIL.Image.Image): The input image to be upscaled.
+        max_batch_size (int): The maximum batch size for processing tiles.
+    
+        Returns:
+        PIL.Image.Image: The upscaled image.
+        """
+        tensor_transform = transforms.ToTensor()
+        device = self.upsampler.device
+
+        image_tensor = tensor_transform(image).unsqueeze(0)
+        _, _, h, w = image_tensor.shape
+        pad_h = (self.input_image_size - h % self.input_image_size) % self.input_image_size
+        pad_w = (self.input_image_size - w % self.input_image_size) % self.input_image_size
+
+        # Pad the image
+        image_tensor = torch.nn.functional.pad(image_tensor, (0, pad_w, 0, pad_h), mode='reflect').squeeze(0)
+        tiles, h_chunks, w_chunks = tile_image(image_tensor, self.input_image_size)
+
+        # Batch processing of tiles
+        num_tiles = len(tiles)
+        batches = [tiles[i:i + max_batch_size] for i in range(0, num_tiles, max_batch_size)]
+        reconstructed_tiles = []
+
+        for batch in batches:
+            model_input = torch.stack(batch).to(device)
+            generator_output = self.upsampler(
+                lowres_image=model_input,
+                noise=torch.randn(model_input.shape[0], 128, device=device)
+            )
+            reconstructed_tiles.extend(list(generator_output.clamp_(0, 1).detach().cpu()))
+
+        # Merge tiles and unpad the image
+        merged_tensor = merge_tiles(reconstructed_tiles, h_chunks, w_chunks, self.input_image_size*2)
+        unpadded = merged_tensor[:, :h * 2, :w * 2]
 
         to_pil = transforms.ToPILImage()
         return to_pil(unpadded)
@@ -950,6 +994,102 @@ class AuraSR:
 
         # Remove padding
         unpadded = result1[:, : h * 4, : w * 4]
+
+        to_pil = transforms.ToPILImage()
+        return to_pil(unpadded)
+
+    # Tiled 2x upscaling with overlapping tiles to reduce seam artifacts
+    # weights options are 'checkboard' and 'constant'
+    @torch.no_grad()
+    def upscale_2x_overlapped(self, image, max_batch_size=8, weight_type='checkboard'):
+        tensor_transform = transforms.ToTensor()
+        device = self.upsampler.device
+
+        image_tensor = tensor_transform(image).unsqueeze(0)
+        _, _, h, w = image_tensor.shape
+
+        # Calculate paddings
+        pad_h = (
+            self.input_image_size - h % self.input_image_size
+        ) % self.input_image_size
+        pad_w = (
+            self.input_image_size - w % self.input_image_size
+        ) % self.input_image_size
+
+        # Pad the image
+        image_tensor = torch.nn.functional.pad(
+            image_tensor, (0, pad_w, 0, pad_h), mode="reflect"
+        ).squeeze(0)
+
+        # Function to process tiles
+        def process_tiles(tiles, h_chunks, w_chunks):
+            num_tiles = len(tiles)
+            batches = [
+                tiles[i : i + max_batch_size]
+                for i in range(0, num_tiles, max_batch_size)
+            ]
+            reconstructed_tiles = []
+
+            for batch in batches:
+                model_input = torch.stack(batch).to(device)
+                generator_output = self.upsampler(
+                    lowres_image=model_input,
+                    noise=torch.randn(model_input.shape[0], 128, device=device),
+                )
+                reconstructed_tiles.extend(
+                    list(generator_output.clamp_(0, 1).detach().cpu())
+                )
+
+            return merge_tiles(
+                reconstructed_tiles, h_chunks, w_chunks, self.input_image_size * 2
+            )
+
+        # First pass
+        tiles1, h_chunks1, w_chunks1 = tile_image(image_tensor, self.input_image_size)
+        result1 = process_tiles(tiles1, h_chunks1, w_chunks1)
+
+        # Second pass with offset
+        offset = self.input_image_size #// 2
+        image_tensor_offset = torch.nn.functional.pad(image_tensor, (offset, offset, offset, offset), mode='reflect').squeeze(0)        
+
+        tiles2, h_chunks2, w_chunks2 = tile_image(
+            image_tensor_offset, self.input_image_size
+        )
+        result2 = process_tiles(tiles2, h_chunks2, w_chunks2)
+
+        # unpad 
+        offset_2x = offset * 2
+        result2_interior = result2[:, offset_2x:-offset_2x, offset_2x:-offset_2x]
+
+        if weight_type == 'checkboard':
+            weight_tile = create_checkerboard_weights(self.input_image_size * 2)
+            
+            weight_shape = result2_interior.shape[1:]
+            weights_1 = create_offset_weights(weight_tile, weight_shape)
+            weights_2 = repeat_weights(weight_tile, weight_shape)
+            
+            normalizer = weights_1 + weights_2
+            weights_1 = weights_1 / normalizer
+            weights_2 = weights_2 / normalizer
+
+            weights_1 = weights_1.unsqueeze(0).repeat(3, 1, 1)
+            weights_2 = weights_2.unsqueeze(0).repeat(3, 1, 1)
+        elif weight_type == 'constant':
+            weights_1 = torch.ones_like(result2_interior) * 0.5
+            weights_2 = weights_1
+        else:
+            raise ValueError("weight_type should be either 'gaussian' or 'constant' but got", weight_type)
+        
+        result1 = result1 * weights_2
+        result2 = result2_interior * weights_1
+
+        # Average the overlapping region
+        result1 = (
+            result1 + result2
+        )
+
+        # Remove padding
+        unpadded = result1[:, : h * 2, : w * 2]
 
         to_pil = transforms.ToPILImage()
         return to_pil(unpadded)

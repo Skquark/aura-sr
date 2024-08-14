@@ -774,7 +774,7 @@ class AuraSR:
         self.input_image_size = config["input_image_size"]
 
     @classmethod
-    def from_pretrained(cls, model_id: str = "fal-ai/AuraSR-v2", use_safetensors: bool = True, device: str = "cuda", cache_dir = None):
+    def from_pretrained(cls, model_id: str = "fal/AuraSR-v2", use_safetensors: bool = True, device: str = "cuda", cache_dir = None):
         import json
         import torch
         from pathlib import Path
@@ -860,16 +860,6 @@ class AuraSR:
 
     @torch.no_grad()
     def upscale_2x(self, image: Image.Image, max_batch_size=8) -> Image.Image:
-        """
-        Custom function. Upscale an input image by 2x using the upscaler.
-    
-        Args:
-        image (PIL.Image.Image): The input image to be upscaled.
-        max_batch_size (int): The maximum batch size for processing tiles.
-    
-        Returns:
-        PIL.Image.Image: The upscaled image.
-        """
         tensor_transform = transforms.ToTensor()
         device = self.upsampler.device
 
@@ -1049,7 +1039,7 @@ class AuraSR:
         result1 = process_tiles(tiles1, h_chunks1, w_chunks1)
 
         # Second pass with offset
-        offset = self.input_image_size #// 2
+        offset = self.input_image_size // 2
         image_tensor_offset = torch.nn.functional.pad(image_tensor, (offset, offset, offset, offset), mode='reflect').squeeze(0)        
 
         tiles2, h_chunks2, w_chunks2 = tile_image(

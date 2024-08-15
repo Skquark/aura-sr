@@ -859,7 +859,7 @@ class AuraSR:
         return to_pil(unpadded)
 
     @torch.no_grad()
-    def upscale_2x(self, image: Image.Image, max_batch_size=8) -> Image.Image:
+    def upscale(self, image: Image.Image, max_batch_size=8, scale=4) -> Image.Image:
         tensor_transform = transforms.ToTensor()
         device = self.upsampler.device
 
@@ -886,8 +886,8 @@ class AuraSR:
             reconstructed_tiles.extend(list(generator_output.clamp_(0, 1).detach().cpu()))
 
         # Merge tiles and unpad the image
-        merged_tensor = merge_tiles(reconstructed_tiles, h_chunks, w_chunks, self.input_image_size*2)
-        unpadded = merged_tensor[:, :h * 2, :w * 2]
+        merged_tensor = merge_tiles(reconstructed_tiles, h_chunks, w_chunks, self.input_image_size * scale)
+        unpadded = merged_tensor[:, :h * scale, :w * scale]
 
         to_pil = transforms.ToPILImage()
         return to_pil(unpadded)
@@ -988,10 +988,10 @@ class AuraSR:
         to_pil = transforms.ToPILImage()
         return to_pil(unpadded)
 
-    # Tiled 2x upscaling with overlapping tiles to reduce seam artifacts
+    # Tiled upscaling by scale x with overlapping tiles to reduce seam artifacts
     # weights options are 'checkboard' and 'constant'
     @torch.no_grad()
-    def upscale_2x_overlapped(self, image, max_batch_size=8, weight_type='checkboard'):
+    def upscale_overlapped(self, image, max_batch_size=8, weight_type='checkboard', scale=4):
         tensor_transform = transforms.ToTensor()
         device = self.upsampler.device
 
@@ -1031,7 +1031,7 @@ class AuraSR:
                 )
 
             return merge_tiles(
-                reconstructed_tiles, h_chunks, w_chunks, self.input_image_size * 2
+                reconstructed_tiles, h_chunks, w_chunks, self.input_image_size * scale
             )
 
         # First pass
@@ -1048,11 +1048,11 @@ class AuraSR:
         result2 = process_tiles(tiles2, h_chunks2, w_chunks2)
 
         # unpad 
-        offset_2x = offset * 2
-        result2_interior = result2[:, offset_2x:-offset_2x, offset_2x:-offset_2x]
+        offset_x = offset * scale
+        result2_interior = result2[:, offset_x:-offset_x, offset_x:-offset_x]
 
         if weight_type == 'checkboard':
-            weight_tile = create_checkerboard_weights(self.input_image_size * 2)
+            weight_tile = create_checkerboard_weights(self.input_image_size * scale)
             
             weight_shape = result2_interior.shape[1:]
             weights_1 = create_offset_weights(weight_tile, weight_shape)
@@ -1079,7 +1079,7 @@ class AuraSR:
         )
 
         # Remove padding
-        unpadded = result1[:, : h * 2, : w * 2]
+        unpadded = result1[:, : h * scale, : w * scale]
 
         to_pil = transforms.ToPILImage()
         return to_pil(unpadded)
